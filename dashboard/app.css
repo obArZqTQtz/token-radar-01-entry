@@ -96,7 +96,7 @@ td.rank { font-weight: 700; color: var(--navy); }
 .down { color: var(--red); font-weight: 600; }
 .bar { height: 6px; border-radius: 3px; background: #e6ebf0; margin-top: 5px; overflow: hidden; }
 .bar i { display: block; height: 100%; background: var(--amber); border-radius: 3px; }
-.mult { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.mult { font-size: 12px; color: var(--muted); }
 .empty { padding: 26px 10px; text-align: center; color: var(--muted); }
 .drawer {
   position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 96vw);

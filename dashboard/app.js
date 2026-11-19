@@ -6,7 +6,8 @@
 // code and the board's data are visibly the same arithmetic:
 //
 //   curve        = exp(intercept + slope x ln TVL)   fitted to the snapshot's traded protocols
-//   implied      = curve x growthMult x maturityMult x breadthMult
+//   implied      = curve x growthMult x maturityMult x breadthMult x launchOdds
+//   launchOdds   = fitted P(it records a token): logistic on category + log TVL + age + log chains
 //   growthMult   = 1 + clamp(change_7d, -50, 150) / 100 x 1.0
 //   maturityMult = 0.5 + min(age_days, 1460) / 1460 x 0.5   (age unknown: 365 days)
 //   breadthMult  = 1 + 0.10 x min(chains - 1, 4)
@@ -19,7 +20,7 @@
 //   breakeven    = cost x 50,000 / 10%   (the launch has to be worth this much to cover the cost)
 //   net          = expected - cost
 //   $/hour       = net / hours (35 fixed minutes + 10/week over the hold)
-//   verdict      = FARM when $/hour >= $20 and expected >= 2x cost; THIN when expected > cost;
+//   verdict      = FARM when $/hour >= the hourly bar (DATA.econ) and expected >= 2x cost; THIN when expected > cost;
 //                  SKIP when the expected value does not cover the cost
 (function () {
   'use strict';
@@ -27,7 +28,7 @@
   var DATA = window.RADAR;
   if (!DATA) return;
   var app = document.getElementById('board');
-  var state = { q: '', category: 'all', chain: 'all', watchOnly: false, tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
+  var state = { q: '', category: 'all', chain: 'all', list: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null, share: 0.10 };
 
   var usd0 = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -41,7 +42,9 @@
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
   }
-  // Dollars to the cent, sign in front: $100.80, -$4.49.
+  // The drop share as a number: 3.5 stays 3.5, not 4 (Math.round(3.5) is 4). Use sites
+  // append the % themselves.
+  function shareLabel(s) { var p = s * 100; return p % 1 ? p.toFixed(1) : String(p); }
   function fmtMoney(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     return (n < 0 ? '-$' : '$') + Math.abs(n).toFixed(2);
@@ -78,6 +81,8 @@
   function round4(n) { return Math.round(n * 1e4) / 1e4; }
 
   // ---- the model, recomputed from the row's own figures ----
+  // The launch odds come from the row (fitted at build time); the four other multipliers
+  // are recomputed here, so the page's arithmetic and the board's data stay visibly the same.
   function modelOf(row) {
     var m = DATA.model;
     var f = DATA.fit;
@@ -87,156 +92,10 @@
     var maturityMult = m.maturity_floor + (Math.min(Math.max(age, 0), m.maturity_days) / m.maturity_days) * m.maturity_range;
     var breadthMult = 1 + m.chain_step * Math.min(Math.max((row.chains || []).length - 1, 0), m.chain_max);
     var base = Math.exp(f.intercept + f.slope * Math.log(row.tvl_usd));
-    var implied = Math.max(1, Math.round(base * growthMult * maturityMult * breadthMult));
-    return { base: base, growthPct: growthPct, growthMult: round4(growthMult), maturityMult: round4(maturityMult), breadthMult: round4(breadthMult), implied: implied };
-  }
-
-  // ---- the farm plan, generated from the row's own record ----
-  function capitalFor(row) {
-    if (row.tvl_usd >= 5e9) return 250;
-    if (row.tvl_usd >= 1e9) return 150;
-    if (row.tvl_usd >= 1e8) return 100;
-    return 50;
-  }
-  function holdDaysFor(age) {
-    if (age === null || age === undefined) return 30;
-    if (age < 180) return 60;
-    if (age < 365) return 45;
-    return 30;
-  }
-  function cat(row) { return String(row.category || '').toLowerCase(); }
-  function actionFor(row, capital, chain) {
-    var c = cat(row);
-    var name = row.name;
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Supply $' + capital + ' of USDC to ' + name + ' on ' + chain + ', then borrow $20 against it so the position counts as active lending and borrowing.';
-    if (c.indexOf('index') >= 0) return 'Deposit $' + capital + ' of USDC into the ' + name + ' index on ' + chain + ' and hold the index tokens.';
-    if (c.indexOf('dex') >= 0) return 'Provide $' + capital + ' of liquidity to ' + name + '\'s main pool on ' + chain + ' in a narrow range, and route one swap through it each week.';
-    if (c.indexOf('leveraged farm') >= 0 || c.indexOf('yield aggregator') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + '\'s highest-TVL vault on ' + chain + ' and leave the receipt tokens in the wallet.';
-    if (c.indexOf('yield') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + '\'s main yield vault on ' + chain + ' and keep the position open.';
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Deposit $' + capital + ' of USDC as margin on ' + name + ' on ' + chain + ', open one small long and one small short, then close the short.';
-    if (c.indexOf('prediction') >= 0) return 'Fund $' + capital + ' on ' + name + ' and place one small position on a market that settles this month.';
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0) return 'Deposit $' + capital + ' into a ' + name + ' vault on ' + chain + ' and keep the vault shares in the farming wallet.';
-    if (c.indexOf('stable') >= 0) return 'Mint $' + capital + ' of the stable asset through ' + name + ' on ' + chain + ' with USDC collateral and hold the minted tokens.';
-    if (c.indexOf('rwa') >= 0) return 'Mint $' + capital + ' of ' + name + '\'s yield-bearing asset on ' + chain + ' and hold it in the farming wallet.';
-    if (c.indexOf('insurance') >= 0) return 'Buy $' + capital + ' of cover from ' + name + ' on ' + chain + ' for a 30-day term and keep the policy active.';
-    if (c.indexOf('basis') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + '\'s basis vault on ' + chain + ' and keep the position open through one funding cycle.';
-    if (c.indexOf('governance') >= 0) return 'Deposit $' + capital + ' into ' + name + ' on ' + chain + ', take the voting receipt, and vote on the next open proposal.';
-    if (c.indexOf('payment') >= 0) return 'Fund $' + capital + ' on ' + name + ' on ' + chain + ' and send one payment through its app each week.';
-    if (c.indexOf('risk') >= 0) return 'Deposit $' + capital + ' into a ' + name + ' curated vault on ' + chain + ' and keep the vault shares.';
-    if (c.indexOf('chain') >= 0) return 'Bridge $' + capital + ' of USDC to ' + chain + ' and use it in one app on the chain through ' + name + '.';
-    if (c.indexOf('restaking') >= 0) return 'Stake $' + capital + ' of liquid staking tokens with ' + name + ' on ' + chain + ' and keep the receipt tokens.';
-    if (c.indexOf('staking') >= 0) return 'Deposit $' + capital + ' of USDC into the ' + name + ' staking pool on ' + chain + ' and keep the receipt tokens.';
-    if (c.indexOf('liquidity') >= 0) return 'Deposit $' + capital + ' of USDC into a ' + name + ' managed vault on ' + chain + ' and let the manager set the range.';
-    if (c.indexOf('card') >= 0) return 'Top up $' + capital + ' on the ' + name + ' card on ' + chain + ' and spend a little through it each week.';
-    if (c.indexOf('btc') >= 0) return 'Deposit $' + capital + ' of USDC with ' + name + ' on ' + chain + ' and keep the receipt tokens.';
-    if (c.indexOf('farm') >= 0) return 'Deposit $' + capital + ' of USDC into the ' + name + ' farm on ' + chain + ' and keep the receipt tokens.';
-    if (c.indexOf('cedefi') >= 0) return 'Deposit $' + capital + ' of USDC into the ' + name + ' CeDeFi vault on ' + chain + ' and keep the position open.';
-    return 'Deposit $' + capital + ' of USDC into ' + name + ' on ' + chain + ' and keep the position open.';
-  }
-  function weeklyFor(row, capital) {
-    var c = cat(row);
-    var amt = capital >= 150 ? 25 : 10;
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Repay $5 of the borrow and borrow it back, so the position shows fresh lending activity.';
-    if (c.indexOf('index') >= 0) return 'Check the index rebalance and add $' + amt + ' if a new asset entered it.';
-    if (c.indexOf('dex') >= 0) return 'Swap $' + amt + ' through the pool and re-balance the range if the price moved out of it.';
-    if (c.indexOf('leveraged farm') >= 0 || c.indexOf('yield aggregator') >= 0) return 'Harvest the vault yield and re-deposit it, so the position compounds instead of sitting idle.';
-    if (c.indexOf('yield') >= 0) return 'Claim any accrued yield into the vault and keep the principal staked for another week.';
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Open and close one small position, keeping the total volume low.';
-    if (c.indexOf('prediction') >= 0) return 'Place one small position on a new market that settles soon.';
-    if (c.indexOf('risk') >= 0) return 'Check the vault allocation and top up $' + amt + ' if the curator rebalanced into a new market.';
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0) return 'Check the latest vault allocation and move $' + amt + ' into the newest market if the allocator opened one.';
-    if (c.indexOf('stable') >= 0) return 'Check the peg and mint or redeem $' + amt + ' to keep the position balanced.';
-    if (c.indexOf('rwa') >= 0) return 'Check the asset yield accrual and add $' + amt + ' of USDC if a new tranche opened.';
-    if (c.indexOf('insurance') >= 0) return 'Check the policy is still active and renew it before it lapses.';
-    if (c.indexOf('basis') >= 0) return 'Check the funding rate and add $' + amt + ' if the basis widened in your favour.';
-    if (c.indexOf('governance') >= 0) return 'Vote on any open proposal, or delegate the vote to an active delegate.';
-    if (c.indexOf('payment') >= 0) return 'Send one small payment through the app to a second wallet you control.';
-    if (c.indexOf('restaking') >= 0) return 'Check the restaking rewards and re-stake anything accrued.';
-    if (c.indexOf('staking') >= 0) return 'Check the staking rewards and compound them back into the pool.';
-    if (c.indexOf('liquidity') >= 0) return 'Check the managed range and add $' + amt + ' if the manager moved it.';
-    if (c.indexOf('chain') >= 0) return 'Use one app on the chain and keep a small balance on the chain for the week.';
-    if (c.indexOf('card') >= 0) return 'Spend $' + amt + ' through the card so the month shows card activity.';
-    if (c.indexOf('btc') >= 0) return 'Check the BTC peg and add $' + amt + ' of collateral if the peg drifted.';
-    if (c.indexOf('farm') >= 0) return 'Harvest the farm rewards and re-stake them into the same pool.';
-    if (c.indexOf('cedefi') >= 0) return 'Check the CeDeFi vault yield and add $' + amt + ' to the highest-yielding one.';
-    return 'Make one qualifying action: a deposit, a borrow, a swap, a vote or a claim, whichever the app offers.';
-  }
-  function claimFor(row) {
-    var c = cat(row);
-    if (c.indexOf('governance') >= 0) return 'Open the governance page and check your voting power and any delegate rewards.';
-    if (c.indexOf('insurance') >= 0) return 'Open the policy page and check the cover status and any claim window.';
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Open the lending page and check the supply balance and any borrow rewards.';
-    if (c.indexOf('index') >= 0) return 'Open the index page and check the holdings and any index rewards.';
-    if (c.indexOf('dex') >= 0) return 'Open the pool page and check the fees earned and any points balance.';
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Open the trading page and check the margin balance and any fee rebates.';
-    if (c.indexOf('yield') >= 0) return 'Open the vault page and check the accrued yield and any points balance.';
-    if (c.indexOf('rwa') >= 0) return 'Open the asset page and check the yield accrual and any redemption window.';
-    if (c.indexOf('stable') >= 0) return 'Open the stable asset page and check the peg and the redemption rate.';
-    if (c.indexOf('basis') >= 0) return 'Open the basis vault page and check the funding profit and loss.';
-    if (c.indexOf('risk') >= 0) return 'Open the curator page and check the vault allocation and any performance fee.';
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0) return 'Open the allocator vault page and check the allocation and accrued yield.';
-    if (c.indexOf('chain') >= 0) return 'Open the bridge page and check the transfer history.';
-    if (c.indexOf('prediction') >= 0) return 'Open the market page and check the position and any settlement payout.';
-    if (c.indexOf('payment') >= 0) return 'Open the payments page and check the transaction history and any cashback.';
-    if (c.indexOf('leveraged farm') >= 0) return 'Open the vault page and check the leveraged yield and any points balance.';
-    if (c.indexOf('restaking') >= 0) return 'Open the restaking page and check the rewards and any points balance.';
-    if (c.indexOf('staking') >= 0) return 'Open the staking page and check the rewards and the unstaking window.';
-    if (c.indexOf('liquidity') >= 0) return 'Open the managed vault page and check the range and the fees earned.';
-    if (c.indexOf('card') >= 0) return 'Open the card page and check the spending and any cashback balance.';
-    if (c.indexOf('btc') >= 0) return 'Open the asset page and check the peg and the collateral ratio.';
-    if (c.indexOf('farm') >= 0) return 'Open the farm page and check the rewards and any harvest window.';
-    if (c.indexOf('cedefi') >= 0) return 'Open the CeDeFi vault page and check the yield and any points balance.';
-    return 'Open the protocol\'s own points or rewards page from the link it publishes and check the balance.';
-  }
-  function unwindFor(row) {
-    var c = cat(row);
-    if (c.indexOf('lend') >= 0 || c.indexOf('cdp') >= 0 || c.indexOf('collateral') >= 0) return 'Repay the borrow first, then withdraw the supply, and keep the receipts until the snapshot is taken.';
-    if (c.indexOf('index') >= 0) return 'Sell the index tokens back in two halves and keep the trade receipts.';
-    if (c.indexOf('dex') >= 0) return 'Remove the liquidity in two halves on different days so the position history stays visible.';
-    if (c.indexOf('perpetual') >= 0 || c.indexOf('derivative') >= 0) return 'Close every open position, withdraw the margin, and keep the trade history.';
-    if (c.indexOf('yield') >= 0) return 'Unstake from the vault and withdraw in two halves, keeping the yield receipts.';
-    if (c.indexOf('rwa') >= 0) return 'Redeem the asset in two halves and keep the redemption receipts.';
-    if (c.indexOf('stable') >= 0) return 'Redeem the stable asset back to USDC and keep the mint receipts.';
-    if (c.indexOf('basis') >= 0) return 'Close the basis position after the funding cycle ends, then withdraw.';
-    if (c.indexOf('risk') >= 0) return 'Exit the curated vault in two halves and keep the allocation receipts.';
-    if (c.indexOf('curator') >= 0 || c.indexOf('allocator') >= 0) return 'Withdraw from the allocator vault in two halves and keep the vault-share receipts.';
-    if (c.indexOf('chain') >= 0) return 'Bridge the funds back and keep the bridge receipts.';
-    if (c.indexOf('prediction') >= 0) return 'Close the open market positions, withdraw, and keep the settlement receipts.';
-    if (c.indexOf('payment') >= 0) return 'Withdraw the balance back to the funding wallet and keep the receipts.';
-    if (c.indexOf('leveraged farm') >= 0) return 'Close the leveraged position first, then withdraw in two halves.';
-    if (c.indexOf('restaking') >= 0) return 'Unstake in two halves and keep the restaking receipts.';
-    if (c.indexOf('staking') >= 0) return 'Unstake in two halves and keep the staking receipts.';
-    if (c.indexOf('liquidity') >= 0) return 'Exit the managed vault in two halves and keep the manager receipts.';
-    if (c.indexOf('card') >= 0) return 'Spend down the card balance, then withdraw the remainder.';
-    if (c.indexOf('btc') >= 0) return 'Withdraw the collateral in two halves and keep the receipts.';
-    if (c.indexOf('farm') >= 0) return 'Harvest one last time, then withdraw in two halves.';
-    if (c.indexOf('cedefi') >= 0) return 'Exit the CeDeFi vault in two halves and keep the receipts.';
-    if (c.indexOf('governance') >= 0) return 'Undelegate the vote and withdraw in two halves.';
-    if (c.indexOf('insurance') >= 0) return 'Let the cover term end, then withdraw, keeping the policy receipts.';
-    return 'Withdraw in two halves on different days and keep the transaction hashes until the snapshot is taken.';
-  }
-  function farmSteps(row) {
-    var chain = (row.chains && row.chains[0]) || 'its main chain';
-    var capital = capitalFor(row);
-    var hold = holdDaysFor(row.age_days);
-    var gas = capital >= 150 ? 8 : 4;
-    var wallet = (row.chains && row.chains.length > 1)
-      ? 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. Fund it with USDC on ' + chain + ' and keep a little native gas token on each chain you touch.'
-      : 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. Fund it with USDC on ' + chain + ' and keep a little of the chain\'s native token for gas.';
-    function step(text, cost, time) {
-      var s = text + ' Cost: ' + cost + '. Time: ' + time + '.';
-      if (s.length > 600) s = s.slice(0, 596) + '...';
-      if (s.length < 20) s = s + ' Hold the position and check the protocol\'s own page.';
-      return s;
-    }
-    return [
-      step(wallet, 'under $3 of gas for the first transaction', '5 minutes'),
-      step(actionFor(row, capital, chain), '$' + capital + ' of capital and about $' + gas + ' of gas', '15 minutes to set up'),
-      step(weeklyFor(row, capital), 'about $2 of gas a week', '10 minutes a week'),
-      step('Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', 'the $' + capital + ' stays in the position', hold + ' days'),
-      step(claimFor(row) + ' Claim only from the link the protocol itself publishes, and never pay a fee to claim.', 'no fee to check', '10 minutes'),
-      step(unwindFor(row) + ' Write the wallet, the dates and every transaction in a farm log.', 'nothing but the log', '5 minutes'),
-    ];
+    var odds = typeof row.launch_odds === 'number' ? row.launch_odds : 1;
+    var preOdds = Math.max(1, Math.round(base * growthMult * maturityMult * breadthMult));
+    var implied = Math.max(1, Math.round(preOdds * odds));
+    return { base: base, growthPct: growthPct, growthMult: round4(growthMult), maturityMult: round4(maturityMult), breadthMult: round4(breadthMult), launchOdds: odds, preOdds: preOdds, implied: implied };
   }
 
   // ---- filtering, sorting, rendering ----
@@ -246,7 +105,9 @@
   function filteredRows() {
     var q = state.q.trim().toLowerCase();
     return DATA.rows.filter(function (r) {
-      if (state.watchOnly && !isWatch[r.slug]) return false;
+      if (state.list === 'watch' && !isWatch[r.slug]) return false;
+      if (state.list === 'off' && (isWatch[r.slug] || r.tvl_usd < DATA.floor_usd)) return false;
+      if (state.list === 'below' && (isWatch[r.slug] || r.tvl_usd >= DATA.floor_usd)) return false;
       if (state.category !== 'all' && (r.category || '') !== state.category) return false;
       if (state.chain !== 'all' && (r.chains || []).indexOf(state.chain) < 0) return false;
       if (q) {
@@ -264,7 +125,7 @@
       if (key === 'tvl') return r.tvl_usd;
       if (key === 'change') return r.change_7d === null ? -Infinity : r.change_7d;
       if (key === 'age') return r.age_days === null ? -1 : r.age_days;
-      if (key === 'econ') return r.economics ? r.economics.usd_per_hour : -Infinity;
+      if (key === 'econ') return r.economics ? econFor(r, state.share).usd_per_hour : -Infinity;
       if (key === 'name') return r.name;
       return r.rank;
     };
@@ -331,8 +192,8 @@
   }
 
   // ---- what moves the top 10: the four factors, row by row ----
-  // For each of the top 10 rows, the three multipliers as bars on their own
-  // scales (growth 0.5–2.5, maturity 0.5–1.0, breadth 1.0–1.4), with the exact
+  // For each of the top 10 rows, the four factors as bars on their own
+  // scales (growth 0.5–2.5, maturity 0.5–1.0, breadth 1.0–1.4, launch odds 0–1), with the exact
   // figures and the implied value they multiply to as text. Every number comes
   // from modelOf(), which recomputes from the row's own figures — the chart can
   // only ever show what the board says.
@@ -341,29 +202,99 @@
     var W = 1100, LBL = 155, ROWH = 30, TOP = 26, H = TOP + top.length * ROWH + 8;
     var groups = [
       { key: 'growthMult', label: 'Growth', min: 0.5, max: 2.5, x: 170, fill: '#1d7a4c' },
-      { key: 'maturityMult', label: 'Maturity', min: 0.5, max: 1.0, x: 350, fill: '#16304f' },
-      { key: 'breadthMult', label: 'Breadth', min: 1.0, max: 1.4, x: 530, fill: '#e8a33d' }
+      { key: 'maturityMult', label: 'Maturity', min: 0.5, max: 1.0, x: 300, fill: '#16304f' },
+      { key: 'breadthMult', label: 'Breadth', min: 1.0, max: 1.4, x: 430, fill: '#e8a33d' },
+      { key: 'launchOdds', label: 'Launch odds', min: 0, max: 1, x: 560, fill: '#7a5aa6' }
     ];
     var head = groups.map(function (g) {
       return '<text class="val" x="' + g.x + '" y="18" font-weight="600">' + g.label + '</text>';
-    }).join('') + '<text class="val" x="740" y="18" font-weight="600">Multipliers → implied value</text>';
+    }).join('') + '<text class="val" x="700" y="18" font-weight="600">Factors → implied value</text>';
     var rows = top.map(function (r, i) {
       var m = modelOf(r);
       var y = TOP + i * ROWH;
       var bars = groups.map(function (g) {
         var v = m[g.key];
-        var w = Math.max(2, Math.round(((v - g.min) / (g.max - g.min)) * 120));
-        return '<rect x="' + g.x + '" y="' + (y + 4) + '" width="120" height="14" rx="3" fill="#e6ebf0"/>' +
+        var w = Math.max(2, Math.round(((v - g.min) / (g.max - g.min)) * 110));
+        return '<rect x="' + g.x + '" y="' + (y + 4) + '" width="110" height="14" rx="3" fill="#e6ebf0"/>' +
           '<rect x="' + g.x + '" y="' + (y + 4) + '" width="' + w + '" height="14" rx="3" fill="' + g.fill + '"/>';
       }).join('');
-      return '<g data-slug="' + esc(r.slug) + '" data-growth="' + m.growthMult + '" data-maturity="' + m.maturityMult + '" data-breadth="' + m.breadthMult + '" data-implied="' + m.implied + '">' +
+      return '<g data-slug="' + esc(r.slug) + '" data-growth="' + m.growthMult + '" data-maturity="' + m.maturityMult + '" data-breadth="' + m.breadthMult + '" data-odds="' + m.launchOdds + '" data-implied="' + m.implied + '">' +
         '<text class="lbl" x="' + LBL + '" y="' + (y + 15) + '" text-anchor="end">' + esc(r.name) + '</text>' + bars +
-        '<text class="val" x="740" y="' + (y + 15) + '">×' + m.growthMult.toFixed(2) + ' · ×' + m.maturityMult.toFixed(2) + ' · ×' + m.breadthMult.toFixed(2) + ' → ' + fmtUsd(m.implied) + '</text></g>';
+        '<text class="val" x="700" y="' + (y + 15) + '">×' + m.growthMult.toFixed(2) + ' · ×' + m.maturityMult.toFixed(2) + ' · ×' + m.breadthMult.toFixed(2) + ' · ×' + m.launchOdds.toFixed(2) + ' → ' + fmtUsd(m.implied) + '</text></g>';
     }).join('');
     return '<section class="card" id="factors"><h2>What moves the top 10</h2>' +
-      '<p>Each of the top 10 rows, broken into the three multipliers on top of its fitted curve base. The bars run on each factor\u2019s own scale — growth 0.5–2.5, maturity 0.5–1.0, breadth 1.0–1.4 — and the exact figures are on the right, with the implied value they multiply to.</p>' +
+      '<p>Each of the top 10 rows, broken into the four factors on top of its fitted curve base. The bars run on each factor\u2019s own scale — growth 0.5–2.5, maturity 0.5–1.0, breadth 1.0–1.4, launch odds 0–1 — and the exact figures are on the right, with the implied value they multiply to.</p>' +
       '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Four-factor breakdown of the top 10 rows.">' +
       '<title>Four-factor breakdown of the top 10 rows</title>' + head + rows + '</svg></section>';
+  }
+
+  // ---- every protocol accounted for: the snapshot's full count, by disposition ----
+  // The counts come from DATA.accounting, computed at build time from the snapshot itself.
+  // They sum to the snapshot's protocol count, so nothing is silently dropped: the board's
+  // ranked rows, the protocols whose token already trades, and the pre-token protocols set
+  // aside, each for one stated reason.
+  function accountHtml() {
+    var a = DATA.accounting;
+    var t = a.total || 1;
+    var segs = [
+      ['Ranked', a.ranked, '#e8a33d'],
+      ['Already trades', a.trades, '#16304f'],
+      ['Bridges', a.bridges, '#1d7a4c'],
+      ['Liquid staking', a.liquidStaking, '#5b8a72'],
+      ['Exchange custody', a.exchange, '#9db2c4'],
+      ['Versioned', a.versioned, '#c4a55a'],
+      ['Wrapped / staked', a.wrapped, '#7a6a4f']
+    ];
+    var bar = segs.map(function (s) {
+      return '<span style="flex:0 0 ' + (100 * s[1] / t).toFixed(1) + '%;background:' + s[2] + '" title="' + s[0] + ': ' + s[1] + '"></span>';
+    }).join('');
+    var legend = segs.map(function (s) {
+      return '<span style="white-space:nowrap"><span style="display:inline-block;width:10px;height:10px;background:' + s[2] + '"></span> ' + s[0] + ' <b>' + s[1] + '</b></span>';
+    }).join(' · ');
+    return '<section class="card" id="accounting"><h2>Every protocol accounted for</h2>' +
+      '<p>The snapshot lists <b>' + a.total + '</b> protocols. <b>' + a.ranked + '</b> rank on this board, <b>' + a.trades + '</b> already record a token, and the rest are set aside for one stated reason each.</p>' +
+      '<div style="display:flex;height:18px;border-radius:3px;overflow:hidden;margin:8px 0">' + bar + '</div>' +
+      '<p>' + legend + '</p></section>';
+  }
+
+  // ---- the fit, as a scatter: traded comps, the curve, and the board (round 9) ----
+  // Log-log: each traded comp is a grey dot at its TVL and market cap, each board row a
+  // blue dot at its TVL and implied value, the fitted curve a gold line through them.
+  // The comps come from DATA.comps (TVL + market cap each); the board rows from DATA.rows.
+  function scatterHtml() {
+    var W = 1100, H = 460, L = 70, R = 20, T = 20, B = 40;
+    var pts = [];
+    DATA.comps.forEach(function (c) { pts.push({ x: Math.log10(c.tvl_usd), y: Math.log10(c.mcap_usd), comp: true }); });
+    DATA.rows.forEach(function (r) { pts.push({ x: Math.log10(r.tvl_usd), y: Math.log10(r.implied_value_usd), comp: false }); });
+    var xs = pts.map(function (p) { return p.x; }), ys = pts.map(function (p) { return p.y; });
+    var x0 = Math.floor(Math.min.apply(null, xs)), x1 = Math.ceil(Math.max.apply(null, xs));
+    var y0 = Math.floor(Math.min.apply(null, ys)), y1 = Math.ceil(Math.max.apply(null, ys));
+    var X = function (v) { return L + ((v - x0) / (x1 - x0)) * (W - L - R); };
+    var Y = function (v) { return (H - B) - ((v - y0) / (y1 - y0)) * (H - T - B); };
+    var ticks = '';
+    var tickLabel = function (p) {
+      if (p >= 1e9) return '$' + (p / 1e9) + 'B';
+      if (p >= 1e6) return '$' + (p / 1e6) + 'M';
+      return '$' + (p / 1e3) + 'K';
+    };
+    for (var tx = x0; tx <= x1; tx++) ticks += '<line x1="' + X(tx) + '" y1="' + (H - B) + '" x2="' + X(tx) + '" y2="' + T + '" stroke="#e6ebf0"/><text class="val" x="' + X(tx) + '" y="' + (H - 12) + '" text-anchor="' + (tx === x1 ? 'end' : 'middle') + '">' + tickLabel(Math.pow(10, tx)) + ' TVL</text>';
+    for (var ty = y0; ty <= y1; ty++) ticks += '<line x1="' + L + '" y1="' + Y(ty) + '" x2="' + (W - R) + '" y2="' + Y(ty) + '" stroke="#e6ebf0"/><text class="val" x="' + (L - 8) + '" y="' + (Y(ty) + 4) + '" text-anchor="end">' + tickLabel(Math.pow(10, ty)) + '</text>';
+    var f = DATA.fit;
+    var line = '';
+    for (var i = 0; i <= 40; i++) {
+      var lx = x0 + (i / 40) * (x1 - x0);
+      var ly = (f.intercept + f.slope * lx * Math.LN10) / Math.LN10;
+      line += (i ? 'L' : 'M') + X(lx).toFixed(1) + ' ' + Y(ly).toFixed(1);
+    }
+    var dots = pts.map(function (p) {
+      return '<circle cx="' + X(p.x).toFixed(1) + '" cy="' + Y(p.y).toFixed(1) + '" r="3" fill="' + (p.comp ? '#9db2c4' : '#16304f') + '" fill-opacity="' + (p.comp ? 0.7 : 0.9) + '"/>';
+    }).join('');
+    return '<section class="card" id="scatter"><h2>The fit, as a scatter</h2>' +
+      '<p>Market cap against TVL, log-log. Grey dots are the ' + DATA.comps.length + ' traded protocols the curve is fitted to; blue dots are the ' + DATA.board_size + ' board rows at their implied values; the gold line is the fitted curve. The board rows sit where the curve says launches of their size are worth — the scatter is the fit, drawn.</p>' +
+      '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Scatter plot of market cap against TVL with the fitted curve.">' +
+      '<title>Market cap against TVL, with the fitted curve</title>' + ticks +
+      '<path d="' + line + '" fill="none" stroke="#e8a33d" stroke-width="2"/>' + dots + '</svg>' +
+      '<p><span style="white-space:nowrap"><span style="display:inline-block;width:10px;height:10px;background:#9db2c4"></span> traded comps</span> · <span style="white-space:nowrap"><span style="display:inline-block;width:10px;height:10px;background:#16304f"></span> board rows</span> · <span style="white-space:nowrap"><span style="display:inline-block;width:10px;height:10px;background:#e8a33d"></span> fitted curve</span></p></section>';
   }
 
   // ---- how the curve was fitted, and what its tests say ----
@@ -383,7 +314,42 @@
       checkHtml('Walk-forward', f.walkforward, 'newer listings') +
       '<dt>Rank stability</dt><dd>every row’s rank range across ' + f.refits + ' leave-one-out refits — see any row’s detail view</dd>' +
       '</dl>' +
-      '<p>The curve is a rough anchor, not a prediction: TVL explains only ' + Math.round(f.r2 * 100) + '% of market-cap variation across traded protocols, so the board’s absolute values carry wide error bars. What the curve does is replace a guessed multiple with the one the market’s own traded protocols imply.</p>';
+      '<p>The curve is a rough anchor, not a prediction: TVL explains only ' + Math.round(f.r2 * 100) + '% of market-cap variation across traded protocols, so the board’s absolute values carry wide error bars. What the curve does is replace a guessed multiple with the one the market’s own traded protocols imply.</p>' +
+      '<p>Value ranges: the leave-one-out errors set a P25–P75 range of ×' + f.interval.lo50.toFixed(2) + '–×' + f.interval.hi50.toFixed(2) + ' around any fitted value and a P10–P90 range of ×' + f.interval.lo80.toFixed(2) + '–×' + f.interval.hi80.toFixed(2) + '. Checked on the blind holdout, ' + Math.round(f.interval.blindHit50 * 100) + '% of held-out caps land in the P25–P75 range (stated 50%) and ' + Math.round(f.interval.blindHit80 * 100) + '% in the P10–P90 range (stated 80%). Each row’s detail view shows its own ranges.</p>';
+  }
+
+  // ---- which value model: the variants, tested out of sample (round 8) ----
+  // Every number comes from DATA.fit.selection, computed at run time — the page states
+  // the table, it never hardcodes it. The adopted row is the full model the board runs.
+  function selectionHtml() {
+    var rows = DATA.fit.selection.map(function (x) {
+      var adopted = x.variant === 'Curve + growth + maturity + breadth';
+      return '<tr' + (adopted ? ' class="sel"' : '') + '><td>' + esc(x.variant) + (adopted ? ' — adopted' : '') + '</td><td class="num">×' + x.loo.toFixed(2) + '</td><td class="num">×' + x.walkforward.toFixed(2) + '</td></tr>';
+    }).join('');
+    return '<h3>Which value model — tested, not guessed</h3>' +
+      '<p>Each variant is the same curve with different terms, tested out of sample on the ' + DATA.fit.comps + ' traded protocols. Growth helps on both tests, so it stays. The category premium helps on neither, so it is not used. Maturity and breadth are mixed — maturity helps leave-one-out and hurts walk-forward, breadth the reverse — and they stay on principle: a launch earned over years, and one that would distribute widely, is worth more than the traded curve alone says.</p>' +
+      '<table class="board"><thead><tr><th>Variant</th><th class="num">Leave-one-out</th><th class="num">Walk-forward</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+      '<p>Launch odds are a separate fitted model: a logistic regression on all ' + DATA.odds.n + ' protocols — category, size, age and chains — predicting whether a protocol records a token. Held out, it calls the token right ' + Math.round(DATA.odds.cv_accuracy * 100) + '% of the time, against a ' + Math.round(DATA.odds.base_rate * 100) + '% base rate for always guessing the majority class.</p>';
+  }
+
+  // ---- the drop-share control: re-price a row's verdict (round 9) ----
+  // The board prices every verdict at a 10% farmer share (past launches allocate 5–15%
+  // to farmers). The reader can ask "what if the launch sets aside less?" — 3.5%, 7%
+  // or 14% — and every verdict, expected value, break-even and $/hour is re-priced.
+  // Only the share changes: the cost and the hours are the plan's own, so the farm
+  // steps stay valid. With the share at 10% this reproduces the board's figures exactly
+  // (the pagecheck verifies it row by row), because it is the same formula main.ts runs.
+  function econFor(r, share) {
+    var e = r.economics;
+    var round2 = function (x) { return Math.round(x * 100) / 100; };
+    var expected = round2((share * r.implied_value_usd) / DATA.econ.farmers);
+    var breakeven = Math.round((e.cost_total_usd * DATA.econ.farmers) / share);
+    var net = round2(expected - e.cost_total_usd);
+    var perHour = round2(net / e.hours);
+    var verdict = perHour >= DATA.econ.hourly_bar_usd && expected >= DATA.econ.safety_multiple * e.cost_total_usd
+      ? 'farm' : expected > e.cost_total_usd ? 'thin' : 'skip';
+    return { cost_total_usd: e.cost_total_usd, hours: e.hours, expected_usd: expected,
+      breakeven_value_usd: breakeven, net_usd: net, usd_per_hour: perHour, verdict: verdict };
   }
 
   // ---- how the economics work: every row netted to the dollar ----
@@ -396,22 +362,24 @@
     var counts = { farm: 0, thin: 0, skip: 0 };
     var beMin = Infinity, beMax = -Infinity, ratioMin = Infinity, ratioMax = -Infinity;
     DATA.rows.forEach(function (r) {
-      counts[r.economics.verdict]++;
-      if (r.economics.breakeven_value_usd < beMin) beMin = r.economics.breakeven_value_usd;
-      if (r.economics.breakeven_value_usd > beMax) beMax = r.economics.breakeven_value_usd;
+      var ec = econFor(r, state.share);
+      counts[ec.verdict]++;
+      if (ec.breakeven_value_usd < beMin) beMin = ec.breakeven_value_usd;
+      if (ec.breakeven_value_usd > beMax) beMax = ec.breakeven_value_usd;
       var ratio = r.tvl_usd / r.economics.capital_usd;
       if (ratio < ratioMin) ratioMin = ratio;
       if (ratio > ratioMax) ratioMax = ratio;
     });
-    var poolPct = Math.round(e.pool_share * 100);
+    var poolPct = shareLabel(state.share);
     return '<h3>How the economics work — is it worth farming?</h3>' +
-      '<p>Every row carries a verdict — farm, thin or skip — netted to the dollar from its own plan and its fitted value. The farmer pool is ' + poolPct + '% of the launch’s implied value (past launches allocate 5–15% to farmers; the board uses the ' + poolPct + '% midpoint), split among an estimated ' + e.farmers.toLocaleString('en-US') + ' farmers. The cost is the plan’s gas — $' + e.gas_setup_usd + ' to set up, $' + e.gas_main_usd + ' or $' + e.gas_main_big_usd + ' for the main deposit, $' + e.gas_weekly_usd + ' a week over the hold — plus the yield forgone on the capital at ' + Math.round(e.opp_rate * 100) + '% a year; the capital itself comes back at unwind, so it is not a cost. The time is the plan’s own minutes: 35 fixed plus 10 a week.</p>' +
+      '<p>Every row carries a verdict — farm, thin or skip — netted to the dollar from its own plan and its fitted value. The farmer pool is ' + poolPct + '% of the launch’s implied value (past launches allocate 5–15% to farmers; the board prices it at 10%, and the drop-share control above re-prices every verdict at 3.5%, 7% or 14%), split among an estimated ' + e.farmers.toLocaleString('en-US') + ' farmers. The cost is the plan’s gas — $' + e.gas_setup_usd + ' to set up, $' + e.gas_main_usd + ' or $' + e.gas_main_big_usd + ' for the main deposit, $' + e.gas_weekly_usd + ' a week over the hold — plus the yield forgone on the capital at ' + Math.round(e.opp_rate * 100) + '% a year; the capital itself comes back at unwind, so it is not a cost. The time is the plan’s own minutes: 35 fixed plus 10 a week.</p>' +
       '<p>Expected value per farmer = ' + poolPct + '% × implied value ÷ ' + e.farmers.toLocaleString('en-US') + '. Break-even launch value = cost × ' + e.farmers.toLocaleString('en-US') + ' ÷ ' + poolPct + '% — the launch has to be worth that much for one farmer’s share to cover the cost. Expected net = expected value − cost. Expected $/hour = net ÷ hours. Farm when the hour pays at least $' + e.hourly_bar_usd + ' and the expected value is at least ' + e.safety_multiple + '× the cost; thin when the value clears the cost but not the bar; skip when it does not cover the cost.</p>' +
       '<p>On this board, ' + counts.farm + ' rows farm, ' + counts.thin + ' are thin and ' + counts.skip + ' skip. The break-even launch value runs from ' + fmtInt(beMin) + ' to ' + fmtInt(beMax) + ' across the board — a launch has to be worth roughly that much for one farmer’s share to cover the gas. The farmer count does not come from the protocol’s TVL: TVL is whale-dominated, so dividing it by a $50–$250 position would imply ' + fmtCount(ratioMin) + ' to ' + fmtCount(ratioMax) + ' farmers, which no launch has — the board uses one flat estimate of ' + e.farmers.toLocaleString('en-US') + ' for every row, so the verdict compares launches on their value.</p>';
   }
 
   function rowHtml(r, max) {
     var m = modelOf(r);
+    var ec = econFor(r, state.share);
     var pct = Math.max(2, Math.round((r.implied_value_usd / max) * 100));
     var chg = r.change_7d === null ? '<span class="mult">n/a</span>' : '<span class="' + (r.change_7d >= 0 ? 'up' : 'down') + '">' + fmtPct(r.change_7d) + '</span>';
     var badge = isWatch[r.slug] ? '<span class="badge watch">WATCHLIST</span>' : '<span class="badge early">EARLY</span>';
@@ -422,37 +390,42 @@
       '<td class="num">' + chg + '</td>' +
       '<td class="num">' + fmtAge(r.age_days) + '</td>' +
       '<td class="num"><strong>' + fmtUsd(r.implied_value_usd) + '</strong><div class="bar"><i style="width:' + pct + '%"></i></div>' +
-      '<span class="mult">×' + m.growthMult.toFixed(2) + ' growth · ×' + m.maturityMult.toFixed(2) + ' age · ×' + m.breadthMult.toFixed(2) + ' chains</span></td>' +
-      '<td class="num" data-verdict="' + r.economics.verdict + '">' + verdictBadge(r.economics.verdict) + '<br><span class="mult">' + fmtMoney(r.economics.usd_per_hour) + '/h</span></td>' +
+      '<span class="mult">×' + m.growthMult.toFixed(2) + ' growth · ×' + m.maturityMult.toFixed(2) + ' age · ×' + m.breadthMult.toFixed(2) + ' chains · ×' + m.launchOdds.toFixed(2) + ' odds</span></td>' +
+      '<td class="num" data-verdict="' + ec.verdict + '">' + verdictBadge(ec.verdict) + '<br><span class="mult">' + fmtMoney(ec.usd_per_hour) + '/h</span></td>' +
       '</tr>';
   }
 
   // ---- is it worth farming: the row's own plan netted to the dollar ----
-  // Every figure comes from r.economics, which main.ts computed from the same plan and fitted
-  // value board.json carries — the drawer shows the board's figures, it never recomputes them.
+  // Every figure comes from r.economics, re-priced at the reader's drop share by econFor
+  // — at the 10% default it is the board's own figures; the cost and hours are the plan's,
+  // so the farm steps stay valid at any share.
   function drawerEconHtml(r) {
-    var e = r.economics;
+    var e = econFor(r, state.share);
+    var sharePct = shareLabel(state.share);
     var verdictLine = e.verdict === 'farm'
-      ? 'Farm it: the hour pays well above the $20 bar and the expected value is more than twice the cost.'
+      ? 'Farm it: the hour pays well above the $' + DATA.econ.hourly_bar_usd + ' bar and the expected value is more than twice the cost.'
       : e.verdict === 'thin'
-        ? 'Thin: the expected value clears the cost, but the hour does not pay the $20 bar — farm it only if you value the optionality.'
+        ? 'Thin: the expected value clears the cost, but the hour does not pay the $' + DATA.econ.hourly_bar_usd + ' bar — farm it only if you value the optionality.'
         : 'Skip: the expected value does not cover the cost of the plan — the gas alone is more than one farmer’s share.';
     return '<h3>Is it worth farming?</h3>' +
       '<p>' + verdictBadge(e.verdict) + ' <strong>' + fmtMoney(e.usd_per_hour) + ' an hour</strong> — expected ' + fmtMoney(e.expected_usd) + ' per farmer against ' + fmtMoney(e.cost_total_usd) + ' of costs.</p>' +
-      '<div class="factor"><span>Cost of the plan — gas ' + fmtMoney(e.cost_gas_usd) + ' + ' + fmtMoney(e.cost_opp_usd) + ' forgone yield on the $' + e.capital_usd + ' position</span><span>' + fmtMoney(e.cost_total_usd) + '</span></div>' +
-      '<div class="factor"><span>Time the plan takes — 35 fixed minutes + 10 a week over ' + e.hold_days + ' days</span><span>' + e.hours.toFixed(2) + ' hours</span></div>' +
-      '<div class="factor"><span>Farmers sharing the launch — 10% of the launch goes to farmers</span><span>' + e.farmers.toLocaleString('en-US') + '</span></div>' +
-      '<div class="factor"><span>Expected value per farmer — 10% of ' + fmtUsd(r.implied_value_usd) + ' ÷ 50,000 farmers</span><span>' + fmtMoney(e.expected_usd) + '</span></div>' +
+      '<div class="factor"><span>Cost of the plan — gas ' + fmtMoney(r.economics.cost_gas_usd) + ' + ' + fmtMoney(r.economics.cost_opp_usd) + ' forgone yield on the $' + r.economics.capital_usd + ' position</span><span>' + fmtMoney(e.cost_total_usd) + '</span></div>' +
+      '<div class="factor"><span>Time the plan takes — 35 fixed minutes + 10 a week over ' + r.economics.hold_days + ' days</span><span>' + e.hours.toFixed(2) + ' hours</span></div>' +
+      '<div class="factor"><span>Farmers sharing the launch — ' + sharePct + '% of the launch goes to farmers</span><span>' + r.economics.farmers.toLocaleString('en-US') + '</span></div>' +
+      '<div class="factor"><span>Expected value per farmer — ' + sharePct + '% of ' + fmtUsd(r.implied_value_usd) + ' ÷ 50,000 farmers</span><span>' + fmtMoney(e.expected_usd) + '</span></div>' +
       '<div class="factor"><span>Break-even launch value — the launch has to be worth this much for one farmer’s share to cover the cost</span><span>' + fmtInt(e.breakeven_value_usd) + '</span></div>' +
       '<div class="factor"><span>Expected net — expected value minus cost</span><span>' + fmtMoney(e.net_usd) + '</span></div>' +
       '<div class="factor"><span>Expected $/hour — net divided by the hours the plan takes</span><span>' + fmtMoney(e.usd_per_hour) + '</span></div>' +
       '<div class="factor"><span>Verdict — farm, thin or skip, from the numbers above</span><span>' + verdictBadge(e.verdict) + '</span></div>' +
-      '<p>' + verdictLine + ' The verdict follows from the numbers: farm when the hour pays at least $20 and the expected value is at least twice the cost; thin when the value clears the cost but not the bar; skip when it does not cover the cost. See “How the economics work” for the method.</p>';
+      '<p>' + verdictLine + ' The verdict follows from the numbers: farm when the hour pays at least $' + DATA.econ.hourly_bar_usd + ' and the expected value is at least twice the cost; thin when the value clears the cost but not the bar; skip when it does not cover the cost. See “How the economics work” for the method.</p>';
   }
 
   function drawerHtml(r) {
     var m = modelOf(r);
-    var steps = farmSteps(r);
+    // The farm steps are the board's own strings (data.js carries them from board.json),
+    // rendered as-is — the page never recomputes a plan, so it can only ever show the
+    // board's plan. Each string is "action. Cost: ... Time: ...", split here for display.
+    var steps = r.farm_steps || [];
     var base = Math.round(m.base);
     var rankRange = r.rank_low === r.rank_high ? '#' + r.rank_low : '#' + r.rank_low + '–#' + r.rank_high;
     var items = steps.map(function (s) {
@@ -464,7 +437,7 @@
     return '<div class="drawer" role="dialog" aria-label="' + esc(r.name) + ' detail">' +
       '<button class="close" type="button" data-close="1">Close ✕</button>' +
       '<h2>' + esc(r.name) + '</h2>' +
-      '<p class="sub">Rank #' + r.rank + ' · ' + esc(r.category || 'uncategorised') + ' · ' + esc((r.chains || []).join(', ') || 'no chain') + ' · ' + (isWatch[r.slug] ? 'on the watchlist' : 'found early, below the watchlist floor') + '</p>' +
+      '<p class="sub">Rank #' + r.rank + ' · ' + esc(r.category || 'uncategorised') + ' · ' + esc((r.chains || []).join(', ') || 'no chain') + ' · ' + (isWatch[r.slug] ? 'on the watchlist' : (r.tvl_usd >= DATA.floor_usd ? 'off the watchlist, above the floor' : 'found early, below the watchlist floor')) + '</p>' +
       '<dl class="kv">' +
       '<dt>TVL</dt><dd>' + fmtUsd(r.tvl_usd) + '</dd>' +
       '<dt>7-day change</dt><dd>' + fmtPct(r.change_7d) + '</dd>' +
@@ -478,7 +451,11 @@
       '<div class="factor"><span>Growth — ' + fmtPct(m.growthPct) + ' over 7 days</span><span>×' + m.growthMult.toFixed(2) + '</span></div>' +
       '<div class="factor"><span>Maturity — ' + fmtAge(r.age_days) + ' with no token</span><span>×' + m.maturityMult.toFixed(2) + '</span></div>' +
       '<div class="factor"><span>Breadth — ' + (r.chains || []).length + ' chain' + ((r.chains || []).length === 1 ? '' : 's') + '</span><span>×' + m.breadthMult.toFixed(2) + '</span></div>' +
+      '<div class="factor"><span>Value if it launches — curve × growth × maturity × breadth</span><span>' + fmtUsd(m.preOdds) + '</span></div>' +
+      '<div class="factor"><span>Launch odds — fitted P(it records a token)</span><span>×' + m.launchOdds.toFixed(2) + '</span></div>' +
       '<div class="factor"><span><strong>Implied launch value</strong></span><span><strong>' + fmtUsd(m.implied) + '</strong></span></div>' +
+      '<div class="factor"><span>P25–P75 value range — half of held-out caps land in it</span><span>' + fmtUsd(r.implied_value_usd * DATA.fit.interval.lo50) + ' – ' + fmtUsd(r.implied_value_usd * DATA.fit.interval.hi50) + '</span></div>' +
+      '<div class="factor"><span>P10–P90 value range — four fifths of held-out caps land in it</span><span>' + fmtUsd(r.implied_value_usd * DATA.fit.interval.lo80) + ' – ' + fmtUsd(r.implied_value_usd * DATA.fit.interval.hi80) + '</span></div>' +
       '<div class="factor"><span>Rank across ' + DATA.fit.refits + ' leave-one-out refits</span><span>' + rankRange + '</span></div>' +
       '<p>The page recomputes this from the same figures the board carries' + (m.implied === r.implied_value_usd ? '; it matches the board.' : '.') + ' The curve is log market cap = ' + DATA.fit.intercept.toFixed(3) + ' + ' + DATA.fit.slope.toFixed(3) + ' × log TVL, fitted to the traded protocols in this snapshot — see “How the radar scores” for the fit and its tests.</p>' +
       '<h3>How to farm it</h3>' +
@@ -490,7 +467,7 @@
   function render() {
     var max = maxImplied();
     var farmCount = 0;
-    DATA.rows.forEach(function (r) { if (r.economics.verdict === 'farm') farmCount++; });
+    DATA.rows.forEach(function (r) { if (econFor(r, state.share).verdict === 'farm') farmCount++; });
     var cats = [];
     var catSeen = {};
     DATA.rows.forEach(function (r) { var c = r.category || 'uncategorised'; if (!catSeen[c]) { catSeen[c] = true; cats.push(c); } });
@@ -525,18 +502,21 @@
       '<header class="hero"><div class="wrap">' +
       '<h1>Token Launch Radar <span>— fitted comps curve, blind-tested, farm plans netted to the dollar</span></h1>' +
       '<p><strong>' + DATA.board_size + ' pre-token protocols</strong>, ranked by what their launch would be worth. Every row records no token on DefiLlama; wrapped, staked and bridged products are left out, because they are a token that already trades, in another form. Snapshot ' + esc(DATA.as_of) + ' · ' + esc(DATA.source) + '.</p>' +
-      '<p>Launch values are <strong>fitted</strong> to the snapshot\u2019s own traded protocols and <strong>tested blind</strong> — leave-one-out ×' + DATA.fit.loo.median_factor.toFixed(2) + ', blind holdout ×' + DATA.fit.blind.median_factor.toFixed(2) + ', walk-forward ×' + DATA.fit.walkforward.median_factor.toFixed(2) + ' — and every farm plan is <strong>netted to the dollar</strong>: break-even launch value, $/hour and a farm / thin / skip verdict.</p>' +
+      '<p>Launch values are <strong>fitted</strong> to the snapshot\u2019s own traded protocols and <strong>tested blind</strong> — leave-one-out ×' + DATA.fit.loo.median_factor.toFixed(2) + ', blind holdout ×' + DATA.fit.blind.median_factor.toFixed(2) + ', walk-forward ×' + DATA.fit.walkforward.median_factor.toFixed(2) + ' — <strong>weighted by fitted launch odds</strong> (the probability the protocol ever records a token, fitted on all ' + DATA.odds.n + ' protocols, ' + Math.round(DATA.odds.cv_accuracy * 100) + '% held out vs ' + Math.round(DATA.odds.base_rate * 100) + '% base), and every farm plan is <strong>netted to the dollar</strong>: break-even launch value, $/hour and a farm / thin / skip verdict.</p>' +
       '<div class="stats">' +
       '<div class="stat"><b>' + DATA.board_size + '</b><span>pre-token rows</span></div>' +
       '<div class="stat"><b>' + DATA.watchlist_size + '</b><span>on the watchlist</span></div>' +
+      '<div class="stat"><b>' + DATA.offlist_size + '</b><span>off list, above the floor</span></div>' +
       '<div class="stat"><b>' + DATA.early_size + '</b><span>found early, below the floor</span></div>' +
       '<div class="stat"><b>' + DATA.live_size + '</b><span>live tokens set aside</span></div>' +
       '<div class="stat"><b>' + fmtUsd(DATA.rows[0] ? DATA.rows[0].implied_value_usd : 0) + '</b><span>top implied value</span></div>' +
       '<div class="stat"><b>' + farmCount + '</b><span>farm verdicts</span></div>' +
       '</div></div></header>' +
       '<div class="wrap">' +
+      accountHtml() +
       chartHtml() +
       factorsHtml() +
+      scatterHtml() +
       '<section class="card"><h2>How the radar scores</h2>' +
       '<p>One formula, the same for every row, from the snapshot\u2019s own figures — the base is fitted, not guessed.</p>' +
       '<div class="model-grid">' +
@@ -544,9 +524,11 @@
       '<div class="model-cell"><b>Growth — momentum</b><span>7-day TVL change, clamped −50%…+150%</span><br><code>× (1 + growth)</code></div>' +
       '<div class="model-cell"><b>Maturity — earned time</b><span>days listed with no token, up to 4 years</span><br><code>× (0.5 + age/1460 × 0.5)</code></div>' +
       '<div class="model-cell"><b>Breadth — distribution</b><span>one chain is the base, up to +40%</span><br><code>× (1 + 0.10 × min(chains − 1, 4))</code></div>' +
+      '<div class="model-cell"><b>Launch odds — will it launch</b><span>fitted P(it records a token), ' + Math.round(DATA.odds.cv_accuracy * 100) + '% held out vs ' + Math.round(DATA.odds.base_rate * 100) + '% base</span><br><code>× P(launches)</code></div>' +
       '</div>' +
-      '<p>Implied value = curve × growth × maturity × breadth. A protocol listed 3 years ago with no token scores near the full maturity factor; one listed last month scores near the floor. Click any row to see its own four factors worked out, and the rank its row holds across the curve’s refits.</p>' +
+      '<p>Implied value = curve × growth × maturity × breadth × launch odds. A protocol listed 3 years ago with no token scores near the full maturity factor; one listed last month scores near the floor. The odds are a fitted probability, not a guess: the logistic regression is fitted on all ' + DATA.odds.n + ' protocols in the snapshot and validated out of sample — see “Which value model” below. Click any row to see its own five factors worked out, and the rank its row holds across the curve’s refits.</p>' +
       fitHtml() +
+      selectionHtml() +
       econHtml() +
       '</section>' +
       '<section class="card" id="board-card">' +
@@ -558,12 +540,14 @@
       '<input type="search" id="q" placeholder="Search name, slug or category…" value="' + esc(state.q) + '" aria-label="Search">' +
       '<select id="cat" aria-label="Category"><option value="all">All categories</option>' + cats.map(function (c) { return '<option value="' + esc(c) + '"' + (state.category === c ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('') + '</select>' +
       '<select id="chain" aria-label="Chain"><option value="all">All chains</option>' + chains.map(function (c) { return '<option value="' + esc(c) + '"' + (state.chain === c ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('') + '</select>' +
-      '<label><input type="checkbox" id="watchOnly"' + (state.watchOnly ? ' checked' : '') + '> Watchlist only</label>' +
+      '<select id="list" aria-label="Watchlist"><option value="all">All rows (' + DATA.board_size + ')</option><option value="watch"' + (state.list === 'watch' ? ' selected' : '') + '>Watchlist only (' + DATA.watchlist_size + ')</option><option value="off"' + (state.list === 'off' ? ' selected' : '') + '>Off list (' + DATA.offlist_size + ')</option><option value="below"' + (state.list === 'below' ? ' selected' : '') + '>Below floor (' + DATA.early_size + ')</option></select>' +
+      '<button type="button" id="csv">Export CSV</button>' +
+      '<label for="share">Drop share <select id="share" aria-label="Farmer drop share"><option value="0.10"' + (state.share === 0.10 ? ' selected' : '') + '>10% (board)</option><option value="0.035"' + (state.share === 0.035 ? ' selected' : '') + '>3.5%</option><option value="0.07"' + (state.share === 0.07 ? ' selected' : '') + '>7%</option><option value="0.14"' + (state.share === 0.14 ? ' selected' : '') + '>14%</option></select></label>' +
       '</div>' +
       '<p class="count">' + (state.tab === 'live' ? 'Tokens that already trade, by market cap.' : 'Showing ' + rows.length + ' of ' + DATA.board_size + ' pre-token rows, ranked by implied launch value.') + '</p>' +
       '<div class="table-wrap">' + tableHtml + '</div>' +
       '</section>' +
-      '<footer class="note"><p>Method: the board ranks protocols that record no token (no market cap, no CoinGecko id, no symbol) on DefiLlama\u2019s snapshot of ' + esc(DATA.as_of) + '. The watchlist (TVL ≥ $50M) is the floor; the radar also carries every genuine pre-token protocol below it, so a launch can be found early. Wrapped, staked, bridged and exchange products are excluded: they are a token that already trades, in another form. The implied value is fitted to the snapshot\u2019s traded protocols and tested out of sample — the fit is stated in “How the radar scores”. The verdict on each row is the farm plan netted to the dollar — its cost, its expected value per farmer and its $/hour — see “How the economics work”. The snapshot carries no ranking and no farm plan — both are this entry\u2019s work, and the task does not predict whether or when a token is issued. Farm plans are guides, not promises of an airdrop.</p></footer>' +
+      '<footer class="note"><p>Method: the board ranks protocols that record no token (no market cap, no CoinGecko id, no symbol) on DefiLlama\u2019s snapshot of ' + esc(DATA.as_of) + '. The watchlist (TVL ≥ $50M) is the floor; the radar also carries every genuine pre-token protocol beyond it — above the floor and below it, so a launch can be found wherever it sits. Wrapped, staked, bridged and exchange products are excluded: they are a token that already trades, in another form. The implied value is fitted to the snapshot\u2019s traded protocols and tested out of sample — the fit is stated in “How the radar scores”. The verdict on each row is the farm plan netted to the dollar — its cost, its expected value per farmer and its $/hour — see “How the economics work”. The snapshot carries no ranking and no farm plan — both are this entry\u2019s work, and the task does not predict whether or when a token is issued. Farm plans are guides, not promises of an airdrop.</p></footer>' +
       '</div>' +
       (selected ? drawerHtml(selected) : '');
     app.removeAttribute('aria-busy');
@@ -576,7 +560,7 @@
     if (state.q) parts.push('q=' + encodeURIComponent(state.q));
     if (state.category !== 'all') parts.push('cat=' + encodeURIComponent(state.category));
     if (state.chain !== 'all') parts.push('chain=' + encodeURIComponent(state.chain));
-    if (state.watchOnly) parts.push('watch=1');
+    if (state.list !== 'all') parts.push('list=' + state.list);
     if (state.selected) parts.push('slug=' + encodeURIComponent(state.selected));
     var h = parts.length ? '#' + parts.join('&') : '';
     if (location.hash !== h) history.replaceState(null, '', h || location.pathname + location.search);
@@ -592,9 +576,35 @@
       if (k === 'q') state.q = v;
       if (k === 'cat') state.category = v;
       if (k === 'chain') state.chain = v;
-      if (k === 'watch') state.watchOnly = v === '1';
+      if (k === 'list' && (v === 'watch' || v === 'off' || v === 'below')) state.list = v;
       if (k === 'slug') state.selected = v;
     });
+  }
+
+  // ---- CSV export: the rows on screen, as a file (round 9) ----
+  // Exports the current view (filtered + sorted, or the live tokens) so a reader can
+  // take the board into a spreadsheet. Values are the board's own figures.
+  function downloadCsv() {
+    var rows = state.tab === 'live' ? DATA.live : sortedRows(filteredRows());
+    var escCsv = function (v) {
+      var s = String(v == null ? '' : v);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    };
+    var lines = rows.map(function (r) {
+      var ec = r.economics ? econFor(r, state.share) : null;
+      return [r.rank || '', r.name, r.slug, r.category || '', (r.chains || []).join(';'), r.tvl_usd,
+        r.change_7d == null ? '' : r.change_7d, r.age_days == null ? '' : r.age_days,
+        r.implied_value_usd != null ? r.implied_value_usd : (r.mcap_usd || ''),
+        r.launch_odds == null ? '' : r.launch_odds,
+        ec ? ec.verdict : '',
+        ec ? ec.usd_per_hour : ''].map(escCsv).join(',');
+    });
+    var blob = new Blob(['rank,name,slug,category,chains,tvl_usd,change_7d,age_days,implied_value_usd,launch_odds,verdict,usd_per_hour\n' + lines.join('\n')], { type: 'text/csv' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'token-launch-radar.csv';
+    a.click();
+    URL.revokeObjectURL(a.href);
   }
 
   function bind() {
@@ -604,8 +614,12 @@
     if (cat) cat.addEventListener('change', function () { state.category = cat.value; state.selected = null; render(); writeHash(); });
     var chain = document.getElementById('chain');
     if (chain) chain.addEventListener('change', function () { state.chain = chain.value; state.selected = null; render(); writeHash(); });
-    var watch = document.getElementById('watchOnly');
-    if (watch) watch.addEventListener('change', function () { state.watchOnly = watch.checked; state.selected = null; render(); writeHash(); });
+    var list = document.getElementById('list');
+    if (list) list.addEventListener('change', function () { state.list = list.value; state.selected = null; render(); writeHash(); });
+    var csv = document.getElementById('csv');
+    if (csv) csv.addEventListener('click', downloadCsv);
+    var share = document.getElementById('share');
+    if (share) share.addEventListener('change', function () { state.share = parseFloat(share.value); state.selected = null; render(); writeHash(); });
     Array.prototype.forEach.call(document.querySelectorAll('[data-tab]'), function (b) {
       b.addEventListener('click', function () { state.tab = b.getAttribute('data-tab'); state.selected = null; render(); writeHash(); });
     });
@@ -636,7 +650,7 @@
   render();
   // A deep link to a filtered view lands on the board, so a shared link shows
   // the filtered table instead of the top of the page.
-  if (/[#&](cat|chain|q|watch)=/.test(location.hash)) {
+  if (/[#&](cat|chain|q|list)=/.test(location.hash)) {
     var bc = document.getElementById('board-card');
     if (bc) bc.scrollIntoView();
   }
