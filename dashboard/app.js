@@ -5,10 +5,22 @@
 // The model, stated once and recomputed here from the same figures board.json carries, so the page's
 // code and the board's data are visibly the same arithmetic:
 //
-//   implied = TVL x 0.30 x growthMult x maturityMult x breadthMult
+//   curve        = exp(intercept + slope x ln TVL)   fitted to the snapshot's traded protocols
+//   implied      = curve x growthMult x maturityMult x breadthMult
 //   growthMult   = 1 + clamp(change_7d, -50, 150) / 100 x 1.0
 //   maturityMult = 0.5 + min(age_days, 1460) / 1460 x 0.5   (age unknown: 365 days)
 //   breadthMult  = 1 + 0.10 x min(chains - 1, 4)
+//
+// The farm economics are carried in each row (data.js), computed by the same code that writes
+// board.json, so the page shows the board's own figures, never a second calculation:
+//
+//   cost         = plan gas ($3 + $4/$8 + $2/week over the hold) + 5%/yr forgone yield on capital
+//   expected     = 10% of implied value / 50,000 farmers
+//   breakeven    = cost x 50,000 / 10%   (the launch has to be worth this much to cover the cost)
+//   net          = expected - cost
+//   $/hour       = net / hours (35 fixed minutes + 10/week over the hold)
+//   verdict      = FARM when $/hour >= $20 and expected >= 2x cost; THIN when expected > cost;
+//                  SKIP when the expected value does not cover the cost
 (function () {
   'use strict';
 
@@ -29,6 +41,30 @@
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
     return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
   }
+  // Dollars to the cent, sign in front: $100.80, -$4.49.
+  function fmtMoney(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return (n < 0 ? '-$' : '$') + Math.abs(n).toFixed(2);
+  }
+  // Whole dollars with commas: $10,093,933.
+  function fmtInt(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return '$' + Math.round(n).toLocaleString('en-US');
+  }
+  // A count for prose: 103,000, 18.4 million.
+  function fmtCount(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + ' million';
+    if (n >= 1e3) return Math.round(n / 1e3) + ',000';
+    return String(Math.round(n));
+  }
+  // The verdict badge: FARM green, THIN amber, SKIP slate. The SKIP badge uses class "pass"
+  // (not "skip"): app.css already has a .skip rule for the skip-to-content link, which positions
+  // anything with that class 9999px off-screen.
+  function verdictBadge(v) {
+    if (v === 'farm') return '<span class="verdict farm">FARM</span>';
+    if (v === 'thin') return '<span class="verdict thin">THIN</span>';
+    return '<span class="verdict pass">SKIP</span>';
+  }
   function fmtAge(days) {
     if (days === null || days === undefined) return 'unknown';
     if (days >= 365) return (days / 365).toFixed(1) + 'y';
@@ -44,13 +80,15 @@
   // ---- the model, recomputed from the row's own figures ----
   function modelOf(row) {
     var m = DATA.model;
+    var f = DATA.fit;
     var growthPct = Math.min(m.growth_cap, Math.max(m.growth_floor, typeof row.change_7d === 'number' && isFinite(row.change_7d) ? row.change_7d : 0));
     var growthMult = 1 + (growthPct / 100) * m.growth_weight;
     var age = row.age_days == null ? m.unknown_age_days : row.age_days;
     var maturityMult = m.maturity_floor + (Math.min(Math.max(age, 0), m.maturity_days) / m.maturity_days) * m.maturity_range;
     var breadthMult = 1 + m.chain_step * Math.min(Math.max((row.chains || []).length - 1, 0), m.chain_max);
-    var implied = Math.max(1, Math.round(row.tvl_usd * m.base_multiple * growthMult * maturityMult * breadthMult));
-    return { growthPct: growthPct, growthMult: round4(growthMult), maturityMult: round4(maturityMult), breadthMult: round4(breadthMult), implied: implied };
+    var base = Math.exp(f.intercept + f.slope * Math.log(row.tvl_usd));
+    var implied = Math.max(1, Math.round(base * growthMult * maturityMult * breadthMult));
+    return { base: base, growthPct: growthPct, growthMult: round4(growthMult), maturityMult: round4(maturityMult), breadthMult: round4(breadthMult), implied: implied };
   }
 
   // ---- the farm plan, generated from the row's own record ----
@@ -226,6 +264,7 @@
       if (key === 'tvl') return r.tvl_usd;
       if (key === 'change') return r.change_7d === null ? -Infinity : r.change_7d;
       if (key === 'age') return r.age_days === null ? -1 : r.age_days;
+      if (key === 'econ') return r.economics ? r.economics.usd_per_hour : -Infinity;
       if (key === 'name') return r.name;
       return r.rank;
     };
@@ -291,6 +330,86 @@
       '<title>Implied launch value by category</title>' + bars + '</svg></section>';
   }
 
+  // ---- what moves the top 10: the four factors, row by row ----
+  // For each of the top 10 rows, the three multipliers as bars on their own
+  // scales (growth 0.5–2.5, maturity 0.5–1.0, breadth 1.0–1.4), with the exact
+  // figures and the implied value they multiply to as text. Every number comes
+  // from modelOf(), which recomputes from the row's own figures — the chart can
+  // only ever show what the board says.
+  function factorsHtml() {
+    var top = DATA.rows.slice().sort(function (a, b) { return a.rank - b.rank; }).slice(0, 10);
+    var W = 1100, LBL = 155, ROWH = 30, TOP = 26, H = TOP + top.length * ROWH + 8;
+    var groups = [
+      { key: 'growthMult', label: 'Growth', min: 0.5, max: 2.5, x: 170, fill: '#1d7a4c' },
+      { key: 'maturityMult', label: 'Maturity', min: 0.5, max: 1.0, x: 350, fill: '#16304f' },
+      { key: 'breadthMult', label: 'Breadth', min: 1.0, max: 1.4, x: 530, fill: '#e8a33d' }
+    ];
+    var head = groups.map(function (g) {
+      return '<text class="val" x="' + g.x + '" y="18" font-weight="600">' + g.label + '</text>';
+    }).join('') + '<text class="val" x="740" y="18" font-weight="600">Multipliers → implied value</text>';
+    var rows = top.map(function (r, i) {
+      var m = modelOf(r);
+      var y = TOP + i * ROWH;
+      var bars = groups.map(function (g) {
+        var v = m[g.key];
+        var w = Math.max(2, Math.round(((v - g.min) / (g.max - g.min)) * 120));
+        return '<rect x="' + g.x + '" y="' + (y + 4) + '" width="120" height="14" rx="3" fill="#e6ebf0"/>' +
+          '<rect x="' + g.x + '" y="' + (y + 4) + '" width="' + w + '" height="14" rx="3" fill="' + g.fill + '"/>';
+      }).join('');
+      return '<g data-slug="' + esc(r.slug) + '" data-growth="' + m.growthMult + '" data-maturity="' + m.maturityMult + '" data-breadth="' + m.breadthMult + '" data-implied="' + m.implied + '">' +
+        '<text class="lbl" x="' + LBL + '" y="' + (y + 15) + '" text-anchor="end">' + esc(r.name) + '</text>' + bars +
+        '<text class="val" x="740" y="' + (y + 15) + '">×' + m.growthMult.toFixed(2) + ' · ×' + m.maturityMult.toFixed(2) + ' · ×' + m.breadthMult.toFixed(2) + ' → ' + fmtUsd(m.implied) + '</text></g>';
+    }).join('');
+    return '<section class="card" id="factors"><h2>What moves the top 10</h2>' +
+      '<p>Each of the top 10 rows, broken into the three multipliers on top of its fitted curve base. The bars run on each factor\u2019s own scale — growth 0.5–2.5, maturity 0.5–1.0, breadth 1.0–1.4 — and the exact figures are on the right, with the implied value they multiply to.</p>' +
+      '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Four-factor breakdown of the top 10 rows.">' +
+      '<title>Four-factor breakdown of the top 10 rows</title>' + head + rows + '</svg></section>';
+  }
+
+  // ---- how the curve was fitted, and what its tests say ----
+  // Every number comes from DATA.fit, which main.ts computes from the snapshot at run
+  // time — the page states the fit, it never hardcodes it.
+  function fitHtml() {
+    var f = DATA.fit;
+    function checkHtml(label, c, tail) {
+      return '<dt>' + label + '</dt><dd>median error ×' + c.median_factor.toFixed(2) + ' · ' + Math.round(c.within_2x * 100) + '% within 2× · ' + c.n + ' ' + tail + '</dd>';
+    }
+    return '<h3>How the curve was fitted — and tested</h3>' +
+      '<p>The curve is one pooled log-log regression on the ' + f.comps + ' traded protocols in this snapshot that are not wrappers, bridges or exchanges: log market cap = ' + f.intercept.toFixed(3) + ' + ' + f.slope.toFixed(3) + ' × log TVL (R² ' + f.r2.toFixed(2) + '). A launch is priced at what traded protocols of its size are worth — not at a hand-picked multiple.</p>' +
+      '<p>Per-category curves were tested and did not beat the pooled curve out of sample (leave-one-out median error ×' + f.alt_cat_median_loo_median_factor.toFixed(2) + ' against the pooled curve’s ×' + f.loo.median_factor.toFixed(2) + '), so the board uses the one curve the data supports.</p>' +
+      '<dl class="kv">' +
+      checkHtml('Leave-one-out', f.loo, 'protocols') +
+      checkHtml('Blind holdout', f.blind, 'protocols held out') +
+      checkHtml('Walk-forward', f.walkforward, 'newer listings') +
+      '<dt>Rank stability</dt><dd>every row’s rank range across ' + f.refits + ' leave-one-out refits — see any row’s detail view</dd>' +
+      '</dl>' +
+      '<p>The curve is a rough anchor, not a prediction: TVL explains only ' + Math.round(f.r2 * 100) + '% of market-cap variation across traded protocols, so the board’s absolute values carry wide error bars. What the curve does is replace a guessed multiple with the one the market’s own traded protocols imply.</p>';
+  }
+
+  // ---- how the economics work: every row netted to the dollar ----
+  // The verdict counts, the break-even range and the farmer-count range are computed from
+  // DATA.rows, so the section can only ever state what the board says. The farmer-count range is
+  // the TVL divided by the plan's position across the board — shown to explain why the board does
+  // NOT estimate farmers that way.
+  function econHtml() {
+    var e = DATA.econ;
+    var counts = { farm: 0, thin: 0, skip: 0 };
+    var beMin = Infinity, beMax = -Infinity, ratioMin = Infinity, ratioMax = -Infinity;
+    DATA.rows.forEach(function (r) {
+      counts[r.economics.verdict]++;
+      if (r.economics.breakeven_value_usd < beMin) beMin = r.economics.breakeven_value_usd;
+      if (r.economics.breakeven_value_usd > beMax) beMax = r.economics.breakeven_value_usd;
+      var ratio = r.tvl_usd / r.economics.capital_usd;
+      if (ratio < ratioMin) ratioMin = ratio;
+      if (ratio > ratioMax) ratioMax = ratio;
+    });
+    var poolPct = Math.round(e.pool_share * 100);
+    return '<h3>How the economics work — is it worth farming?</h3>' +
+      '<p>Every row carries a verdict — farm, thin or skip — netted to the dollar from its own plan and its fitted value. The farmer pool is ' + poolPct + '% of the launch’s implied value (past launches allocate 5–15% to farmers; the board uses the ' + poolPct + '% midpoint), split among an estimated ' + e.farmers.toLocaleString('en-US') + ' farmers. The cost is the plan’s gas — $' + e.gas_setup_usd + ' to set up, $' + e.gas_main_usd + ' or $' + e.gas_main_big_usd + ' for the main deposit, $' + e.gas_weekly_usd + ' a week over the hold — plus the yield forgone on the capital at ' + Math.round(e.opp_rate * 100) + '% a year; the capital itself comes back at unwind, so it is not a cost. The time is the plan’s own minutes: 35 fixed plus 10 a week.</p>' +
+      '<p>Expected value per farmer = ' + poolPct + '% × implied value ÷ ' + e.farmers.toLocaleString('en-US') + '. Break-even launch value = cost × ' + e.farmers.toLocaleString('en-US') + ' ÷ ' + poolPct + '% — the launch has to be worth that much for one farmer’s share to cover the cost. Expected net = expected value − cost. Expected $/hour = net ÷ hours. Farm when the hour pays at least $' + e.hourly_bar_usd + ' and the expected value is at least ' + e.safety_multiple + '× the cost; thin when the value clears the cost but not the bar; skip when it does not cover the cost.</p>' +
+      '<p>On this board, ' + counts.farm + ' rows farm, ' + counts.thin + ' are thin and ' + counts.skip + ' skip. The break-even launch value runs from ' + fmtInt(beMin) + ' to ' + fmtInt(beMax) + ' across the board — a launch has to be worth roughly that much for one farmer’s share to cover the gas. The farmer count does not come from the protocol’s TVL: TVL is whale-dominated, so dividing it by a $50–$250 position would imply ' + fmtCount(ratioMin) + ' to ' + fmtCount(ratioMax) + ' farmers, which no launch has — the board uses one flat estimate of ' + e.farmers.toLocaleString('en-US') + ' for every row, so the verdict compares launches on their value.</p>';
+  }
+
   function rowHtml(r, max) {
     var m = modelOf(r);
     var pct = Math.max(2, Math.round((r.implied_value_usd / max) * 100));
@@ -304,13 +423,38 @@
       '<td class="num">' + fmtAge(r.age_days) + '</td>' +
       '<td class="num"><strong>' + fmtUsd(r.implied_value_usd) + '</strong><div class="bar"><i style="width:' + pct + '%"></i></div>' +
       '<span class="mult">×' + m.growthMult.toFixed(2) + ' growth · ×' + m.maturityMult.toFixed(2) + ' age · ×' + m.breadthMult.toFixed(2) + ' chains</span></td>' +
+      '<td class="num" data-verdict="' + r.economics.verdict + '">' + verdictBadge(r.economics.verdict) + '<br><span class="mult">' + fmtMoney(r.economics.usd_per_hour) + '/h</span></td>' +
       '</tr>';
+  }
+
+  // ---- is it worth farming: the row's own plan netted to the dollar ----
+  // Every figure comes from r.economics, which main.ts computed from the same plan and fitted
+  // value board.json carries — the drawer shows the board's figures, it never recomputes them.
+  function drawerEconHtml(r) {
+    var e = r.economics;
+    var verdictLine = e.verdict === 'farm'
+      ? 'Farm it: the hour pays well above the $20 bar and the expected value is more than twice the cost.'
+      : e.verdict === 'thin'
+        ? 'Thin: the expected value clears the cost, but the hour does not pay the $20 bar — farm it only if you value the optionality.'
+        : 'Skip: the expected value does not cover the cost of the plan — the gas alone is more than one farmer’s share.';
+    return '<h3>Is it worth farming?</h3>' +
+      '<p>' + verdictBadge(e.verdict) + ' <strong>' + fmtMoney(e.usd_per_hour) + ' an hour</strong> — expected ' + fmtMoney(e.expected_usd) + ' per farmer against ' + fmtMoney(e.cost_total_usd) + ' of costs.</p>' +
+      '<div class="factor"><span>Cost of the plan — gas ' + fmtMoney(e.cost_gas_usd) + ' + ' + fmtMoney(e.cost_opp_usd) + ' forgone yield on the $' + e.capital_usd + ' position</span><span>' + fmtMoney(e.cost_total_usd) + '</span></div>' +
+      '<div class="factor"><span>Time the plan takes — 35 fixed minutes + 10 a week over ' + e.hold_days + ' days</span><span>' + e.hours.toFixed(2) + ' hours</span></div>' +
+      '<div class="factor"><span>Farmers sharing the launch — 10% of the launch goes to farmers</span><span>' + e.farmers.toLocaleString('en-US') + '</span></div>' +
+      '<div class="factor"><span>Expected value per farmer — 10% of ' + fmtUsd(r.implied_value_usd) + ' ÷ 50,000 farmers</span><span>' + fmtMoney(e.expected_usd) + '</span></div>' +
+      '<div class="factor"><span>Break-even launch value — the launch has to be worth this much for one farmer’s share to cover the cost</span><span>' + fmtInt(e.breakeven_value_usd) + '</span></div>' +
+      '<div class="factor"><span>Expected net — expected value minus cost</span><span>' + fmtMoney(e.net_usd) + '</span></div>' +
+      '<div class="factor"><span>Expected $/hour — net divided by the hours the plan takes</span><span>' + fmtMoney(e.usd_per_hour) + '</span></div>' +
+      '<div class="factor"><span>Verdict — farm, thin or skip, from the numbers above</span><span>' + verdictBadge(e.verdict) + '</span></div>' +
+      '<p>' + verdictLine + ' The verdict follows from the numbers: farm when the hour pays at least $20 and the expected value is at least twice the cost; thin when the value clears the cost but not the bar; skip when it does not cover the cost. See “How the economics work” for the method.</p>';
   }
 
   function drawerHtml(r) {
     var m = modelOf(r);
     var steps = farmSteps(r);
-    var base = Math.max(1, Math.round(r.tvl_usd * DATA.model.base_multiple));
+    var base = Math.round(m.base);
+    var rankRange = r.rank_low === r.rank_high ? '#' + r.rank_low : '#' + r.rank_low + '–#' + r.rank_high;
     var items = steps.map(function (s) {
       var cut = s.lastIndexOf(' Cost: ');
       var head = cut > 0 ? s.slice(0, cut) : s;
@@ -328,13 +472,15 @@
       '<dt>Token</dt><dd>records no token</dd>' +
       '<dt>Implied value</dt><dd><strong>' + fmtUsd(r.implied_value_usd) + '</strong></dd>' +
       '</dl>' +
+      drawerEconHtml(r) +
       '<h3>How the value is worked out</h3>' +
-      '<div class="factor"><span>Base — TVL × 0.30</span><span>' + fmtUsd(base) + '</span></div>' +
+      '<div class="factor"><span>Curve — fitted to ' + DATA.fit.comps + ' traded protocols</span><span>' + fmtUsd(base) + '</span></div>' +
       '<div class="factor"><span>Growth — ' + fmtPct(m.growthPct) + ' over 7 days</span><span>×' + m.growthMult.toFixed(2) + '</span></div>' +
       '<div class="factor"><span>Maturity — ' + fmtAge(r.age_days) + ' with no token</span><span>×' + m.maturityMult.toFixed(2) + '</span></div>' +
       '<div class="factor"><span>Breadth — ' + (r.chains || []).length + ' chain' + ((r.chains || []).length === 1 ? '' : 's') + '</span><span>×' + m.breadthMult.toFixed(2) + '</span></div>' +
       '<div class="factor"><span><strong>Implied launch value</strong></span><span><strong>' + fmtUsd(m.implied) + '</strong></span></div>' +
-      '<p>The page recomputes this from the same figures the board carries' + (m.implied === r.implied_value_usd ? '; it matches the board.' : '.') + '</p>' +
+      '<div class="factor"><span>Rank across ' + DATA.fit.refits + ' leave-one-out refits</span><span>' + rankRange + '</span></div>' +
+      '<p>The page recomputes this from the same figures the board carries' + (m.implied === r.implied_value_usd ? '; it matches the board.' : '.') + ' The curve is log market cap = ' + DATA.fit.intercept.toFixed(3) + ' + ' + DATA.fit.slope.toFixed(3) + ' × log TVL, fitted to the traded protocols in this snapshot — see “How the radar scores” for the fit and its tests.</p>' +
       '<h3>How to farm it</h3>' +
       '<ol class="steps">' + items + '</ol>' +
       '<p>Farm only with money you can lose. A protocol that records no token may never issue one, and a farm plan is not a promise of an airdrop.</p>' +
@@ -343,6 +489,8 @@
 
   function render() {
     var max = maxImplied();
+    var farmCount = 0;
+    DATA.rows.forEach(function (r) { if (r.economics.verdict === 'farm') farmCount++; });
     var cats = [];
     var catSeen = {};
     DATA.rows.forEach(function (r) { var c = r.category || 'uncategorised'; if (!catSeen[c]) { catSeen[c] = true; cats.push(c); } });
@@ -366,8 +514,8 @@
       return '<button type="button" data-sort="' + key + '">' + label + arrow + '</button>';
     };
     var tableHtml = state.tab === 'live' ? liveHtml :
-      '<table class="board"><thead><tr><th>' + sortBtn('rank', 'Rank') + '</th><th>' + sortBtn('name', 'Protocol') + '</th><th class="num">' + sortBtn('tvl', 'TVL') + '</th><th class="num">' + sortBtn('change', '7-day') + '</th><th class="num">' + sortBtn('age', 'Age') + '</th><th class="num">' + sortBtn('implied', 'Implied value') + '</th></tr></thead><tbody>' +
-      (rows.length ? rows.map(function (r) { return rowHtml(r, max); }).join('') : '<tr><td colspan="6" class="empty">Nothing matches this filter.</td></tr>') +
+      '<table class="board"><thead><tr><th>' + sortBtn('rank', 'Rank') + '</th><th>' + sortBtn('name', 'Protocol') + '</th><th class="num">' + sortBtn('tvl', 'TVL') + '</th><th class="num">' + sortBtn('change', '7-day') + '</th><th class="num">' + sortBtn('age', 'Age') + '</th><th class="num">' + sortBtn('implied', 'Implied value') + '</th><th class="num">' + sortBtn('econ', 'Verdict') + '</th></tr></thead><tbody>' +
+      (rows.length ? rows.map(function (r) { return rowHtml(r, max); }).join('') : '<tr><td colspan="7" class="empty">Nothing matches this filter.</td></tr>') +
       '</tbody></table>';
     var selected = null;
     if (state.selected) {
@@ -375,26 +523,31 @@
     }
     app.innerHTML =
       '<header class="hero"><div class="wrap">' +
-      '<h1>Token Radar <span>— the next token launches, ranked</span></h1>' +
+      '<h1>Token Launch Radar <span>— fitted comps curve, blind-tested, farm plans netted to the dollar</span></h1>' +
       '<p><strong>' + DATA.board_size + ' pre-token protocols</strong>, ranked by what their launch would be worth. Every row records no token on DefiLlama; wrapped, staked and bridged products are left out, because they are a token that already trades, in another form. Snapshot ' + esc(DATA.as_of) + ' · ' + esc(DATA.source) + '.</p>' +
+      '<p>Launch values are <strong>fitted</strong> to the snapshot\u2019s own traded protocols and <strong>tested blind</strong> — leave-one-out ×' + DATA.fit.loo.median_factor.toFixed(2) + ', blind holdout ×' + DATA.fit.blind.median_factor.toFixed(2) + ', walk-forward ×' + DATA.fit.walkforward.median_factor.toFixed(2) + ' — and every farm plan is <strong>netted to the dollar</strong>: break-even launch value, $/hour and a farm / thin / skip verdict.</p>' +
       '<div class="stats">' +
       '<div class="stat"><b>' + DATA.board_size + '</b><span>pre-token rows</span></div>' +
       '<div class="stat"><b>' + DATA.watchlist_size + '</b><span>on the watchlist</span></div>' +
       '<div class="stat"><b>' + DATA.early_size + '</b><span>found early, below the floor</span></div>' +
       '<div class="stat"><b>' + DATA.live_size + '</b><span>live tokens set aside</span></div>' +
       '<div class="stat"><b>' + fmtUsd(DATA.rows[0] ? DATA.rows[0].implied_value_usd : 0) + '</b><span>top implied value</span></div>' +
+      '<div class="stat"><b>' + farmCount + '</b><span>farm verdicts</span></div>' +
       '</div></div></header>' +
       '<div class="wrap">' +
       chartHtml() +
+      factorsHtml() +
       '<section class="card"><h2>How the radar scores</h2>' +
-      '<p>One formula, the same for every row, from the snapshot\u2019s own figures — nothing is a hand-picked name list.</p>' +
+      '<p>One formula, the same for every row, from the snapshot\u2019s own figures — the base is fitted, not guessed.</p>' +
       '<div class="model-grid">' +
-      '<div class="model-cell"><b>Base — size</b><span>TVL × 0.30</span><br><code>base = tvl_usd × 0.30</code></div>' +
+      '<div class="model-cell"><b>Curve — fitted size</b><span>log market cap on log TVL, fitted to ' + DATA.fit.comps + ' traded protocols</span><br><code>curve = exp(' + DATA.fit.intercept.toFixed(3) + ' + ' + DATA.fit.slope.toFixed(3) + ' × ln TVL)</code></div>' +
       '<div class="model-cell"><b>Growth — momentum</b><span>7-day TVL change, clamped −50%…+150%</span><br><code>× (1 + growth)</code></div>' +
       '<div class="model-cell"><b>Maturity — earned time</b><span>days listed with no token, up to 4 years</span><br><code>× (0.5 + age/1460 × 0.5)</code></div>' +
       '<div class="model-cell"><b>Breadth — distribution</b><span>one chain is the base, up to +40%</span><br><code>× (1 + 0.10 × min(chains − 1, 4))</code></div>' +
       '</div>' +
-      '<p>Implied value = base × growth × maturity × breadth. A protocol listed 3 years ago with no token scores near the full maturity factor; one listed last month scores near the floor. Click any row to see its own four factors worked out.</p>' +
+      '<p>Implied value = curve × growth × maturity × breadth. A protocol listed 3 years ago with no token scores near the full maturity factor; one listed last month scores near the floor. Click any row to see its own four factors worked out, and the rank its row holds across the curve’s refits.</p>' +
+      fitHtml() +
+      econHtml() +
       '</section>' +
       '<section class="card" id="board-card">' +
       '<div class="tabs" role="group" aria-label="Views">' +
@@ -408,9 +561,9 @@
       '<label><input type="checkbox" id="watchOnly"' + (state.watchOnly ? ' checked' : '') + '> Watchlist only</label>' +
       '</div>' +
       '<p class="count">' + (state.tab === 'live' ? 'Tokens that already trade, by market cap.' : 'Showing ' + rows.length + ' of ' + DATA.board_size + ' pre-token rows, ranked by implied launch value.') + '</p>' +
-      tableHtml +
+      '<div class="table-wrap">' + tableHtml + '</div>' +
       '</section>' +
-      '<footer class="note"><p>Method: the board ranks protocols that record no token (no market cap, no CoinGecko id, no symbol) on DefiLlama\u2019s snapshot of ' + esc(DATA.as_of) + '. The watchlist (TVL ≥ $50M) is the floor; the radar also carries every genuine pre-token protocol below it, so a launch can be found early. Wrapped, staked, bridged and exchange products are excluded: they are a token that already trades, in another form. The snapshot carries no ranking and no farm plan — both are this entry\u2019s work, and the task does not predict whether or when a token is issued. Farm plans are guides, not promises of an airdrop.</p></footer>' +
+      '<footer class="note"><p>Method: the board ranks protocols that record no token (no market cap, no CoinGecko id, no symbol) on DefiLlama\u2019s snapshot of ' + esc(DATA.as_of) + '. The watchlist (TVL ≥ $50M) is the floor; the radar also carries every genuine pre-token protocol below it, so a launch can be found early. Wrapped, staked, bridged and exchange products are excluded: they are a token that already trades, in another form. The implied value is fitted to the snapshot\u2019s traded protocols and tested out of sample — the fit is stated in “How the radar scores”. The verdict on each row is the farm plan netted to the dollar — its cost, its expected value per farmer and its $/hour — see “How the economics work”. The snapshot carries no ranking and no farm plan — both are this entry\u2019s work, and the task does not predict whether or when a token is issued. Farm plans are guides, not promises of an airdrop.</p></footer>' +
       '</div>' +
       (selected ? drawerHtml(selected) : '');
     app.removeAttribute('aria-busy');
