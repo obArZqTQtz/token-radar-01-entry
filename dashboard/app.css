@@ -126,7 +126,6 @@ td.rank { font-weight: 700; color: var(--navy); }
 .steps li b { display: block; }
 .steps li span { color: var(--muted); font-size: 13px; }
 footer.note { color: var(--muted); font-size: 13px; margin-top: 16px; }
-footer.note code { font-size: 12px; }
 @media (max-width: 720px) {
   header.hero h1 { font-size: 24px; }
   table.board th:nth-child(4), table.board td:nth-child(4),
